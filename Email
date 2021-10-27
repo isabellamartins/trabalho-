@@ -1,0 +1,247 @@
+using LotusDigital.Core.Entities;
+using LotusDigital.Core.Services;
+using LotusDigital.Infrastructure.Data;
+using LotusDigital.Infrastructure.Hangfire;
+using MediatR;
+using Microsoft.EntityFrameworkCore;
+using System;
+using System.Collections.Generic;
+using System.ComponentModel;
+using System.Linq;
+using System.Net.Mail;
+using System.Text;
+using System.Threading;
+using System.Threading.Tasks;
+
+namespace LotusDigital.Features.ReservaCnpj
+{
+    public class ReservaCnpjEmailJob
+    {
+        private readonly ApplicationDbContext _context;
+        private readonly EmailService _emailService;
+        private readonly IHangfireMediator _hangfireMedietor;
+
+        public ReservaCnpjEmailJob(ApplicationDbContext context, EmailService emailService, IHangfireMediator hangfireMediator)
+        {
+            _context = context;
+            _emailService = emailService;
+            _hangfireMedietor = hangfireMediator;
+        }
+
+        [DisplayName("ReservaCnpjEmailJob")]
+        public void Execute()
+        {
+            var cedentes = _context.Titulo
+                 .Include(x => x.Cedente)
+                 .ThenInclude(x => x.CedenteParametro)
+                 .ThenInclude(x => x.Gerente)
+                 .GroupBy(x => new
+                 {
+                     x.Cedente.Id,
+                     x.Cedente.CpfCnpj,
+                     x.Cedente.CedenteParametro.Gerente.Nome,
+                 })
+                 .Select(x => new
+                 {
+                     Id = x.Key.Id,
+                     CpfCnpj = x.Key.CpfCnpj,
+                     RiscoAtual = x.Where(x => x.Status == StatusTitulo.Aceito && x.Pago == false)
+                                    .Sum(x => x.Valor),            
+                     UltimoPagamento = x.Select(x => x.DataPagamento).Max(),
+
+                     Gerente = x.Key.Nome
+                 })
+                 .ToList();
+
+            var reservas = _context.ReservaCnpj
+                      .GroupJoin(_context.ReservaCnpjFila,
+                      reserva => reserva.Cnpj,
+                      fila => fila.Cnpj,
+                      (reserva, fila) => new
+                      {
+                          reserva,
+                          fila
+                      })
+                      .SelectMany(x => x.fila.DefaultIfEmpty(),
+                      (reserva, fila) => new
+                      {
+                          reserva,
+                          fila
+                      })
+                      .Select(x => new
+                      {
+                          Gerente = x.fila.Gerente,
+                          CnpjCedente = x.fila.Cnpj,
+                          DataHoraFila = x.fila.DataHoraFila,
+                          DataReserva = x.reserva.reserva.DataReserva
+                      }).ToList();
+
+            var cedentesReserva = cedentes.Join(reservas,
+                                      cedente => cedente.CpfCnpj,
+                                      reserva => reserva.CnpjCedente,
+                                      (cedente, reserva) => new
+                                      {
+                                          cedente,
+                                          reserva
+                                      })
+                                .Select(x => new
+                                {
+                                    Cedente = x.cedente,
+                                    Reserva = x.reserva
+                                })
+                                .ToList();
+
+            var reserva = _context.Cedente
+                      .GroupJoin(_context.ReservaCnpjFila,
+                      reserva => reserva.CpfCnpj,
+                      fila => fila.Cnpj,
+                      (reserva, fila) => new
+                      {
+                          reserva,
+                          fila
+                      })
+                      .SelectMany(x => x.fila.DefaultIfEmpty(),
+                      (reserva, fila) => new
+                      {
+                          reserva,
+                          fila
+                      })
+                      .Select(x => new
+                      {
+                          Gerente = x.fila.Gerente,
+                          Id = x.reserva.reserva.Id,
+                          CnpjCedente = x.fila.Cnpj,
+                          DataHoraFila = x.fila.DataHoraFila,
+                          NumeroCnpj = x.reserva.reserva.Numero,
+                          DataReserva = x.reserva.reserva,
+                      }).ToList();
+
+            foreach (var cedenteReserva in cedentesReserva)
+            {
+                var possuiRisco = cedenteReserva.Cedente.RiscoAtual > 0;
+
+                //Verificar os dias, pois quase todos os cedentes irão possuir risco
+                var riscoMaior90dias = !(cedenteReserva.Cedente.UltimoPagamento < DateTime.Today.AddDays(-90));
+
+                foreach (var cedente in cedentes)
+                {
+                    if (possuiRisco && riscoMaior90dias)
+                    {
+                        var reserva30dias = cedenteReserva.Reserva.DataHoraFila.Value.AddDays(30);
+
+                        if (reserva30dias == DateTime.Today) 
+                        {
+                            var email = _context.Titulo
+                                .Include(x => x.Cedente)
+                                .GroupBy(x => new
+                                {
+                                    x.Cedente.Id,
+                                    x.Cedente.CpfCnpj,
+                                    //x.Cedente.,
+                                })
+                                .Select(x => new
+                                {
+                                    Id = x.Key.Id,
+                                    Cnpj = x.Key.CpfCnpj,
+                                    TituloAberto = x.Where(x => x.Status == StatusTitulo.Aceito && x.Pago == false),
+                                    UltimoPagamento = x.Select(x => x.DataPagamento < x.DataAbatimento).Max(),                                 
+                                })
+                                .ToList();
+
+
+
+                            foreach (var gerente in cedentes)
+                            {
+                                if (cedente == null)
+                                {
+                                    var gerentes = _context.Titulo
+                                        .Include(x => x.Cedente)
+                                        .GroupBy(x => new
+                                        {
+                                            Id = x.Cedente.Id,
+                                            Cnpj = x.Cedente.CpfCnpj,
+                                            DataPago = x.DataPagamento,
+                                            Aceito = x.Aceito
+                                        })
+                                        .Select(x => new
+                                        {
+                                            Id = x.Key.Id,
+                                            Cnpj = x.Key.Cnpj,
+                                            ValorRisco = x.Where(x => x.Status == StatusTitulo.Aceito && x.Pago == false),
+                                            Valor = x.Select(x => x.Valor).Sum(),
+                                            DataPago = x.Select(x => x.Aceito).Max()
+
+                                        })
+                                        .ToList();
+                                }
+                            }
+
+                            //enviar para o email
+
+                            var startTimeSan = TimeSpan.Zero;
+                            var periodTimeSpan = TimeSpan.FromDays(15);
+
+                            //var timer = new System.Threading.Timer((e)) 
+                            //{
+                            //    if (DateTime.Now.TimeOfDay >= System.TimeSpan.Parse("08:27:00.000") && DateTime.Now.TimeOfDay <= System.TimeSpan.Parse("08:40:00.000"))
+                            //        || (DateTime.Now.TimeOfDay >= System.TimeSpan.Parse("16:00:00.000") && DateTime.Now.TimeOfDay <= System.TimeSpan.Parse("16:10:00.000")))
+                            //}
+
+                            //email = new MailMessage();
+
+                            //email.Subject = "MacPartner - Teste Aviso";
+                            //email.From = new MailAddress("isabella.martins@hotmail.com.br");
+                            //email.To.Add("isabella.martins@hotmail.com.br");
+                            //email.IsBodyHtml = true;
+                            //SmtpServer.Port = 587;
+                            //SmtpServer.Credentials = new System.Net.NetworkCredential("macpartner@macpartner.com.br", "M@cP@rtner");
+                            //SmtpServer.EnableSsl = true;
+
+
+
+
+                            var email15Dias = cedenteReserva.Cedente.RiscoAtual > 0;
+
+                            var alerta15Dias = !(cedenteReserva.Reserva.DataReserva < DateTime.Today.AddDays(15));
+
+                            foreach (var reservacedente in cedentes)
+                            {
+                                if (email15Dias && alerta15Dias)
+                                {
+                                    var reserva15Dias = cedenteReserva.Reserva.DataHoraFila.Value.AddDays(15);
+
+                                    if (reserva15Dias == DateTime.Today)
+                                    {
+                                        var gerenteEmail = _context.ReservaCnpj
+                                            .GroupJoin(_context.Cedente,
+                                            reserva => reserva.Cnpj,
+                                            cnpj => cnpj.CpfCnpj,
+                                            (reserva, cnpj) => new
+                                            {
+                                                reserva,
+                                                cnpj
+                                            })
+                                            .Select(x => new
+                                            {
+                                                Gerente = x.reserva.Gerente,
+                                                CnpjCedente = x.reserva.Cnpj,
+                                                DataReserva = x.reserva.DataReserva
+                                            }).ToList();
+                                    }
+
+                                    var painelFIDC = _emailService.GetEmailsParaEnviarAsync().GetAwaiter().GetResult();
+
+                                    var emails = _emailService.GetEmailByTemplateAsync(EmailTemplate.ReservaCnpj, new
+                                    {
+                                        painelFIDC
+                                    }).GetAwaiter().GetResult();
+
+                                }
+                            }
+                        }
+                    }                    
+                }                                   
+            }
+        }
+    }
+}
